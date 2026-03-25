@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bamboo-server ./cmd/
 
 FROM alpine:3.21
 
-RUN apk add --no-cache iptables iproute2 ethtool
+RUN apk add --no-cache iptables iproute2 ethtool dnsmasq
 
 COPY --from=builder /bamboo-server /usr/local/bin/bamboo-server
 COPY server/web/ /app/web/

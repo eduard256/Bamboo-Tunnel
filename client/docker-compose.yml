@@ -1,0 +1,15 @@
+services:
+  bamboo-client:
+    build:
+      context: ..
+      dockerfile: client/Dockerfile
+    container_name: bamboo-client
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - .env
+    sysctls:
+      - net.ipv4.ip_forward=1
