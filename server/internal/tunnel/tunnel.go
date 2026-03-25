@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	batchSize    = 32 * 1024     // 32KB max coalesced payload
-	batchTimeout = time.Millisecond // flush after 1ms of no new packets
-	pktChanSize  = 4096          // buffered channel for packets
-	writeBufSize = 64 * 1024     // bufio.Writer buffer
+	batchSize    = 64 * 1024             // 64KB max coalesced payload
+	batchTimeout = 200 * time.Microsecond // flush after 200us idle
+	pktChanSize  = 8192                  // buffered channel for packets
+	writeBufSize = 128 * 1024            // bufio.Writer buffer
 )
 
 var (
@@ -155,13 +155,11 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	log.Info("tunnel client disconnected", "remote", r.RemoteAddr)
 }
 
-// batchWriteLoop collects packets from channel and writes them as coalesced frames.
-// Flushes when: buffer exceeds batchSize, or batchTimeout elapsed since last packet.
+// batchWriteLoop collects packets and writes them as coalesced frames.
+// Strategy: drain all available packets, flush immediately. If nothing available, wait with short timer.
 func (c *conn) batchWriteLoop() {
-	coalBuf := make([]byte, batchSize+2*1500) // extra room
+	coalBuf := make([]byte, batchSize+2*1500)
 	frameBuf := make([]byte, protocol.MaxFrameSize)
-	timer := time.NewTimer(batchTimeout)
-	timer.Stop()
 
 	var packets [][]byte
 	var coalSize int
@@ -170,81 +168,63 @@ func (c *conn) batchWriteLoop() {
 		if len(packets) == 0 {
 			return
 		}
-
-		off := 0
-		off = protocol.CoalescePackets(coalBuf, packets)
-
+		off := protocol.CoalescePackets(coalBuf, packets)
 		f := &protocol.Frame{
 			Type:    protocol.TypeData,
 			Seq:     c.seq.Add(1),
 			Payload: coalBuf[:off],
 		}
-		n := protocol.MarshalFrame(frameBuf, f, protocol.RandPadding(1, 3))
+		n := protocol.MarshalFrame(frameBuf, f, 1) // minimal padding for speed
 		c.bw.Write(frameBuf[:n])
 		c.bw.Flush()
 		c.flusher.Flush()
-
 		packets = packets[:0]
 		coalSize = 0
 	}
 
+	sendHeartbeat := func() {
+		flush()
+		hb := &protocol.Frame{
+			Type:    protocol.TypeHeartbeat,
+			Seq:     c.seq.Add(1),
+			Payload: protocol.MakeHeartbeatPayload(),
+		}
+		n := protocol.MarshalFrame(frameBuf, hb, protocol.RandPadding(5, 20))
+		c.bw.Write(frameBuf[:n])
+		c.bw.Flush()
+		c.flusher.Flush()
+	}
+
 	for {
+		// blocking wait for first packet
 		select {
 		case <-c.done:
 			flush()
 			return
-
 		case pkt := <-c.pktCh:
 			if pkt == nil {
-				// heartbeat signal
-				flush()
-				hb := &protocol.Frame{
-					Type:    protocol.TypeHeartbeat,
-					Seq:     c.seq.Add(1),
-					Payload: protocol.MakeHeartbeatPayload(),
-				}
-				n := protocol.MarshalFrame(frameBuf, hb, protocol.RandPadding(5, 20))
-				c.bw.Write(frameBuf[:n])
-				c.bw.Flush()
-				c.flusher.Flush()
+				sendHeartbeat()
 				continue
 			}
-
 			packets = append(packets, pkt)
 			coalSize += 2 + len(pkt)
-
-			if coalSize >= batchSize {
-				timer.Stop()
-				flush()
-				continue
-			}
-
-			// drain channel without blocking
-			drained := true
-			for drained {
-				select {
-				case pkt2 := <-c.pktCh:
-					if pkt2 == nil {
-						continue // skip heartbeat during drain
-					}
-					packets = append(packets, pkt2)
-					coalSize += 2 + len(pkt2)
-					if coalSize >= batchSize {
-						timer.Stop()
-						flush()
-					}
-				default:
-					drained = false
-				}
-			}
-
-			if len(packets) > 0 {
-				timer.Reset(batchTimeout)
-			}
-
-		case <-timer.C:
-			flush()
 		}
+
+		// aggressive drain -- grab everything available
+		for coalSize < batchSize {
+			select {
+			case pkt := <-c.pktCh:
+				if pkt == nil {
+					continue
+				}
+				packets = append(packets, pkt)
+				coalSize += 2 + len(pkt)
+			default:
+				goto flushNow
+			}
+		}
+	flushNow:
+		flush()
 	}
 }
 

@@ -19,9 +19,8 @@ import (
 )
 
 const (
-	batchSize    = 32 * 1024
-	batchTimeout = time.Millisecond
-	pktChanSize  = 4096
+	batchSize   = 64 * 1024
+	pktChanSize = 8192
 )
 
 var (
@@ -228,12 +227,9 @@ func connect() (*session, error) {
 	return s, nil
 }
 
-// batchUploadLoop collects packets and writes them as batched frames to upload pipe
 func (s *session) batchUploadLoop() {
 	coalBuf := make([]byte, batchSize+2*1500)
 	frameBuf := make([]byte, protocol.MaxFrameSize)
-	timer := time.NewTimer(batchTimeout)
-	timer.Stop()
 
 	var packets [][]byte
 	var coalSize int
@@ -242,19 +238,27 @@ func (s *session) batchUploadLoop() {
 		if len(packets) == 0 {
 			return
 		}
-
 		off := protocol.CoalescePackets(coalBuf, packets)
-
 		f := &protocol.Frame{
 			Type:    protocol.TypeData,
 			Seq:     s.seq.Add(1),
 			Payload: coalBuf[:off],
 		}
-		n := protocol.MarshalFrame(frameBuf, f, protocol.RandPadding(1, 3))
+		n := protocol.MarshalFrame(frameBuf, f, 1)
 		s.uploadPW.Write(frameBuf[:n])
-
 		packets = packets[:0]
 		coalSize = 0
+	}
+
+	sendHeartbeat := func() {
+		flush()
+		hb := &protocol.Frame{
+			Type:    protocol.TypeHeartbeat,
+			Seq:     s.seq.Add(1),
+			Payload: protocol.MakeHeartbeatPayload(),
+		}
+		n := protocol.MarshalFrame(frameBuf, hb, protocol.RandPadding(5, 20))
+		s.uploadPW.Write(frameBuf[:n])
 	}
 
 	for {
@@ -262,56 +266,29 @@ func (s *session) batchUploadLoop() {
 		case <-s.done:
 			flush()
 			return
-
 		case pkt := <-s.pktCh:
 			if pkt == nil {
-				// heartbeat signal
-				flush()
-				hb := &protocol.Frame{
-					Type:    protocol.TypeHeartbeat,
-					Seq:     s.seq.Add(1),
-					Payload: protocol.MakeHeartbeatPayload(),
-				}
-				n := protocol.MarshalFrame(frameBuf, hb, protocol.RandPadding(5, 20))
-				s.uploadPW.Write(frameBuf[:n])
+				sendHeartbeat()
 				continue
 			}
-
 			packets = append(packets, pkt)
 			coalSize += 2 + len(pkt)
-
-			if coalSize >= batchSize {
-				timer.Stop()
-				flush()
-				continue
-			}
-
-			// drain channel
-			drained := true
-			for drained {
-				select {
-				case pkt2 := <-s.pktCh:
-					if pkt2 == nil {
-						continue
-					}
-					packets = append(packets, pkt2)
-					coalSize += 2 + len(pkt2)
-					if coalSize >= batchSize {
-						timer.Stop()
-						flush()
-					}
-				default:
-					drained = false
-				}
-			}
-
-			if len(packets) > 0 {
-				timer.Reset(batchTimeout)
-			}
-
-		case <-timer.C:
-			flush()
 		}
+
+		for coalSize < batchSize {
+			select {
+			case pkt := <-s.pktCh:
+				if pkt == nil {
+					continue
+				}
+				packets = append(packets, pkt)
+				coalSize += 2 + len(pkt)
+			default:
+				goto flushNow
+			}
+		}
+	flushNow:
+		flush()
 	}
 }
 
