@@ -16,10 +16,9 @@ import (
 )
 
 const (
-	batchSize    = 64 * 1024             // 64KB max coalesced payload
-	batchTimeout = 200 * time.Microsecond // flush after 200us idle
-	pktChanSize  = 8192                  // buffered channel for packets
-	writeBufSize = 128 * 1024            // bufio.Writer buffer
+	batchSize    = 60000         // must fit in uint16 (65535 max frame payload)
+	pktChanSize  = 8192
+	writeBufSize = 128 * 1024
 )
 
 var (
@@ -159,7 +158,7 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 // Strategy: drain all available packets, flush immediately. If nothing available, wait with short timer.
 func (c *conn) batchWriteLoop() {
 	coalBuf := make([]byte, batchSize+2*1500)
-	frameBuf := make([]byte, protocol.MaxFrameSize)
+	frameBuf := make([]byte, batchSize+2*1500+protocol.MaxFrameSize)
 
 	var packets [][]byte
 	var coalSize int

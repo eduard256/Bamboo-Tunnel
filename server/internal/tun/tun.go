@@ -122,7 +122,13 @@ func configureLAN(iface, gateway, subnet string) error {
 }
 
 func routeLANThroughTUN(lanSubnet, tunDev string) error {
-	// traffic from LAN devices goes through TUN to VPS
+	// clean up stale rules from previous runs (ignore errors)
+	for range 10 {
+		run("iptables", "-D", "FORWARD", "-i", "eth1", "-o", tunDev, "-j", "ACCEPT")
+		run("iptables", "-D", "FORWARD", "-i", tunDev, "-o", "eth1", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		run("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", tunDev, "-j", "MASQUERADE")
+	}
+
 	// iptables FORWARD: allow LAN -> TUN
 	if err := run("iptables", "-A", "FORWARD", "-i", "eth1", "-o", tunDev, "-j", "ACCEPT"); err != nil {
 		return fmt.Errorf("forward out: %w", err)

@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	batchSize   = 64 * 1024
+	batchSize   = 60000 // must fit in uint16 (65535 max frame payload)
 	pktChanSize = 8192
 )
 
@@ -120,20 +120,16 @@ func sessionLoop() {
 			prev.close()
 		}
 
-		duration := randomDuration(sessionMin, sessionMax)
-		log.Info("session started", "duration", duration, "id", s.sessionID)
+		log.Info("session started", "id", s.sessionID)
 
 		go s.readLoop()
 		go s.batchUploadLoop()
 		go s.heartbeatLoop()
 
-		select {
-		case <-time.After(duration - sessionOverlap):
-			log.Info("session rotating")
-		case <-s.done:
-			log.Warn("session died, reconnecting")
-			activeConn.CompareAndSwap(s, nil)
-		}
+		// no rotation -- keep session alive until it dies
+		<-s.done
+		log.Warn("session died, reconnecting")
+		activeConn.CompareAndSwap(s, nil)
 	}
 }
 
@@ -229,10 +225,20 @@ func connect() (*session, error) {
 
 func (s *session) batchUploadLoop() {
 	coalBuf := make([]byte, batchSize+2*1500)
-	frameBuf := make([]byte, protocol.MaxFrameSize)
+	frameBuf := make([]byte, batchSize+2*1500+protocol.MaxFrameSize) // room for oversized batch
 
 	var packets [][]byte
 	var coalSize int
+
+	write := func(data []byte) bool {
+		select {
+		case <-s.done:
+			return false
+		default:
+		}
+		_, err := s.uploadPW.Write(data)
+		return err == nil
+	}
 
 	flush := func() {
 		if len(packets) == 0 {
@@ -245,7 +251,7 @@ func (s *session) batchUploadLoop() {
 			Payload: coalBuf[:off],
 		}
 		n := protocol.MarshalFrame(frameBuf, f, 1)
-		s.uploadPW.Write(frameBuf[:n])
+		write(frameBuf[:n])
 		packets = packets[:0]
 		coalSize = 0
 	}
@@ -258,7 +264,7 @@ func (s *session) batchUploadLoop() {
 			Payload: protocol.MakeHeartbeatPayload(),
 		}
 		n := protocol.MarshalFrame(frameBuf, hb, protocol.RandPadding(5, 20))
-		s.uploadPW.Write(frameBuf[:n])
+		write(frameBuf[:n])
 	}
 
 	for {
@@ -342,12 +348,13 @@ func (s *session) heartbeatLoop() {
 }
 
 func (s *session) close() {
+	s.markDone()
+	// write close frame, ignore errors on dead pipe
 	f := &protocol.Frame{Type: protocol.TypeClose, Seq: s.seq.Add(1)}
 	buf := make([]byte, protocol.MaxFrameSize)
 	n := protocol.MarshalFrame(buf, f, protocol.RandPadding(5, 15))
 	s.uploadPW.Write(buf[:n])
 	s.uploadPW.Close()
-	s.markDone()
 	s.body.Close()
 }
 
