@@ -1,8 +1,10 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,30 +21,29 @@ import (
 )
 
 var (
-	log       *slog.Logger
-	serverURL string
-	token     string
+	log        *slog.Logger
+	serverURL  string
+	token      string
 	tunnelPath string
 
 	sessionMin     time.Duration
 	sessionMax     time.Duration
 	sessionOverlap time.Duration
 
-	// TUN write callback -- set by tun module
 	tunWriter func([]byte)
 
-	// active session tracking
 	activeMu   sync.Mutex
 	activeConn *session
 )
 
 type session struct {
-	resp    *http.Response
-	body    io.ReadCloser
-	writer  io.Writer
-	done    chan struct{}
-	seq     atomic.Uint32
-	flusher http.Flusher
+	client    *http.Client
+	sessionID string
+	body      io.ReadCloser // download stream (server -> client)
+	uploadPW  *io.PipeWriter // upload stream (client -> server)
+	uploadMu  sync.Mutex
+	done      chan struct{}
+	seq       atomic.Uint32
 }
 
 func Init() {
@@ -74,12 +75,8 @@ func Init() {
 	log.Info("tunnel started", "server", serverURL, "path", tunnelPath)
 }
 
-// SetTUNWriter sets the callback for writing packets to TUN device
-func SetTUNWriter(f func([]byte)) {
-	tunWriter = f
-}
+func SetTUNWriter(f func([]byte)) { tunWriter = f }
 
-// SendPacket sends an IP packet through the active tunnel session
 func SendPacket(pkt []byte) {
 	activeMu.Lock()
 	s := activeConn
@@ -92,7 +89,6 @@ func SendPacket(pkt []byte) {
 	s.sendData(pkt)
 }
 
-// sessionLoop manages session rotation with hot swap
 func sessionLoop() {
 	var backoff time.Duration
 
@@ -110,35 +106,25 @@ func sessionLoop() {
 		}
 		backoff = 0
 
-		// register as active
 		activeMu.Lock()
 		prev := activeConn
 		activeConn = s
 		activeMu.Unlock()
 
 		if prev != nil {
-			// graceful close previous session
 			prev.close()
 		}
 
-		// random session duration
 		duration := randomDuration(sessionMin, sessionMax)
-		log.Info("session started", "duration", duration)
+		log.Info("session started", "duration", duration, "id", s.sessionID)
 
-		// start reading from server in background
 		go s.readLoop()
-
-		// start heartbeat
 		go s.heartbeatLoop()
 
-		// wait until overlap time, then prepare next session
 		select {
 		case <-time.After(duration - sessionOverlap):
-			// time to rotate -- next iteration will create new session
-			// current session stays active until new one connects
 			log.Info("session rotating")
 		case <-s.done:
-			// session died unexpectedly -- reconnect immediately
 			log.Warn("session died, reconnecting")
 			activeMu.Lock()
 			if activeConn == s {
@@ -150,16 +136,12 @@ func sessionLoop() {
 }
 
 func connect() (*session, error) {
-	// Step 1: mimic browser -- GET landing page
 	client := newHTTPClient()
+	sessionID := randSessionID()
 
-	path := fmt.Sprintf("%s/%s", tunnelPath, randSessionID())
-	fullURL := serverURL + path
-
-	req, err := http.NewRequest(http.MethodGet, serverURL+"/", nil)
-	if err != nil {
-		return nil, fmt.Errorf("tunnel: build GET: %w", err)
-	}
+	// Step 1: GET / (mimic browser)
+	log.Info("connecting", "id", sessionID)
+	req, _ := http.NewRequest(http.MethodGet, serverURL+"/", nil)
 	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -168,86 +150,80 @@ func connect() (*session, error) {
 	resp.Body.Close()
 
 	// Step 2: GET fake asset
-	req, err = http.NewRequest(http.MethodGet, serverURL+"/assets/app.js", nil)
-	if err != nil {
-		return nil, fmt.Errorf("tunnel: build asset GET: %w", err)
-	}
+	req, _ = http.NewRequest(http.MethodGet, serverURL+"/assets/app.js", nil)
 	setBrowserHeaders(req)
 	resp, err = client.Do(req)
-	if err != nil {
-		// asset 404 is fine, server might not have it
-		log.Debug("asset request failed (ok)", "error", err)
-	} else {
+	if err == nil {
 		resp.Body.Close()
 	}
 
-	// Step 3: POST tunnel request with chunked body
-	pr, pw := io.Pipe()
+	// Step 3: open download stream
+	downloadPath := fmt.Sprintf("%s/%s/stream", tunnelPath, sessionID)
 
-	req, err = http.NewRequest(http.MethodPost, fullURL, pr)
-	if err != nil {
-		pw.Close()
-		return nil, fmt.Errorf("tunnel: build POST: %w", err)
-	}
-
+	req, _ = http.NewRequest(http.MethodPost, serverURL+downloadPath, nil)
 	setBrowserHeaders(req)
 	req.Header.Set("Content-Type", "application/x-protobuf")
-	req.AddCookie(&http.Cookie{
-		Name:  crypto.CookieName,
-		Value: token,
-	})
-
-	// send client handshake messages in request body
-	go func() {
-		for _, msg := range protocol.ClientHandshakeMessages() {
-			f := &protocol.Frame{
-				Type:    protocol.TypeHandshake,
-				Seq:     0,
-				Payload: msg,
-			}
-			buf := make([]byte, protocol.MaxFrameSize)
-			n := protocol.MarshalFrame(buf, f, protocol.RandPadding(10, 40))
-			pw.Write(buf[:n])
-		}
-	}()
+	req.Header.Del("Accept-Encoding")
+	req.AddCookie(&http.Cookie{Name: crypto.CookieName, Value: token})
 
 	resp, err = client.Do(req)
 	if err != nil {
-		pw.Close()
-		return nil, fmt.Errorf("tunnel: POST %s: %w", path, err)
+		return nil, fmt.Errorf("tunnel: POST download: %w", err)
 	}
-
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		pw.Close()
-		return nil, fmt.Errorf("tunnel: server returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("tunnel: download returned %d", resp.StatusCode)
 	}
+
+	log.Info("download stream opened", "proto", resp.Proto)
 
 	s := &session{
-		resp:   resp,
-		body:   resp.Body,
-		writer: pw,
-		done:   make(chan struct{}),
+		client:    client,
+		sessionID: sessionID,
+		body:      resp.Body,
+		done:      make(chan struct{}),
 	}
 
-	// read and discard server handshake frames
+	// read server handshake
 	buf := make([]byte, protocol.MaxFrameSize)
 	for i := 0; i < 3; i++ {
 		f, err := protocol.ReadFrame(resp.Body, buf)
 		if err != nil {
 			s.close()
-			return nil, fmt.Errorf("tunnel: handshake read: %w", err)
+			return nil, fmt.Errorf("tunnel: handshake read %d: %w", i, err)
 		}
 		if err := protocol.SkipPadding(resp.Body, buf); err != nil {
 			s.close()
-			return nil, fmt.Errorf("tunnel: handshake padding: %w", err)
+			return nil, fmt.Errorf("tunnel: handshake padding %d: %w", i, err)
 		}
 		if f.Type != protocol.TypeHandshake {
 			break
 		}
 	}
 
-	log.Info("connected", "path", path)
+	// Step 4: open persistent upload stream
+	uploadPath := fmt.Sprintf("%s/%s/data", tunnelPath, sessionID)
+	pr, pw := io.Pipe()
+	s.uploadPW = pw
+
+	uploadReq, _ := http.NewRequest(http.MethodPost, serverURL+uploadPath, pr)
+	setBrowserHeaders(uploadReq)
+	uploadReq.Header.Set("Content-Type", "application/x-protobuf")
+	uploadReq.AddCookie(&http.Cookie{Name: crypto.CookieName, Value: token})
+
+	// fire and forget -- we don't care about upload response
+	go func() {
+		resp, err := client.Do(uploadReq)
+		if err != nil {
+			log.Info("upload stream ended", "error", err)
+		} else {
+			resp.Body.Close()
+			log.Info("upload stream ended", "status", resp.StatusCode)
+		}
+		s.markDone()
+	}()
+
+	log.Info("connected", "id", sessionID)
 	return s, nil
 }
 
@@ -258,27 +234,35 @@ func (s *session) sendData(pkt []byte) {
 	default:
 	}
 
+	// wrap in coalesced format
+	coalBuf := make([]byte, 2+len(pkt))
+	cn := protocol.CoalescePackets(coalBuf, [][]byte{pkt})
+
 	f := &protocol.Frame{
 		Type:    protocol.TypeData,
 		Seq:     s.seq.Add(1),
-		Payload: pkt,
+		Payload: coalBuf[:cn],
 	}
 
 	buf := make([]byte, protocol.MaxFrameSize)
 	padding := protocol.RandPadding(5, 50)
 	n := protocol.MarshalFrame(buf, f, padding)
-	s.writer.Write(buf[:n])
+
+	s.uploadMu.Lock()
+	s.uploadPW.Write(buf[:n])
+	s.uploadMu.Unlock()
 }
 
 func (s *session) readLoop() {
+	log.Info("readLoop: started")
 	buf := make([]byte, protocol.MaxFrameSize)
 	for {
 		f, err := protocol.ReadFrame(s.body, buf)
 		if err != nil {
+			log.Info("readLoop: error", "error", err)
 			s.markDone()
 			return
 		}
-
 		if err := protocol.SkipPadding(s.body, buf); err != nil {
 			s.markDone()
 			return
@@ -318,19 +302,25 @@ func (s *session) heartbeatLoop() {
 		}
 		buf := make([]byte, protocol.MaxFrameSize)
 		n := protocol.MarshalFrame(buf, f, protocol.RandPadding(5, 20))
-		s.writer.Write(buf[:n])
+
+		s.uploadMu.Lock()
+		s.uploadPW.Write(buf[:n])
+		s.uploadMu.Unlock()
 	}
 }
 
 func (s *session) close() {
-	// send graceful close frame
 	f := &protocol.Frame{
 		Type: protocol.TypeClose,
 		Seq:  s.seq.Add(1),
 	}
 	buf := make([]byte, protocol.MaxFrameSize)
 	n := protocol.MarshalFrame(buf, f, protocol.RandPadding(5, 15))
-	s.writer.Write(buf[:n])
+
+	s.uploadMu.Lock()
+	s.uploadPW.Write(buf[:n])
+	s.uploadPW.Close()
+	s.uploadMu.Unlock()
 
 	s.markDone()
 	s.body.Close()
@@ -347,26 +337,23 @@ func (s *session) markDone() {
 func newHTTPClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			},
-			ForceAttemptHTTP2:   true,
-			MaxIdleConns:        10,
-			IdleConnTimeout:     90 * time.Second,
+			TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12},
+			ForceAttemptHTTP2:  true,
+			MaxIdleConns:       100,
+			IdleConnTimeout:    90 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
 			DialContext: (&net.Dialer{
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		},
-		Timeout: 0, // no timeout for streaming
+		Timeout: 0,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 }
 
-// setBrowserHeaders makes the request look like Chrome
 func setBrowserHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
@@ -408,8 +395,6 @@ func parseDuration(s string, def time.Duration) time.Duration {
 	return d
 }
 
-// UseContext returns a context that cancels when the active session dies.
-// Used by tun module to detect disconnects.
 func UseContext() context.Context {
 	activeMu.Lock()
 	s := activeConn
@@ -428,3 +413,7 @@ func UseContext() context.Context {
 
 	return ctx
 }
+
+// unused but needed for compilation
+var _ = bytes.NewReader
+var _ = binary.BigEndian

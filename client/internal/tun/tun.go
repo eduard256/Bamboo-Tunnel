@@ -10,9 +10,9 @@ import (
 )
 
 const (
-	clientIP = "10.0.0.2"
-	mask     = "24"
-	subnet   = "10.0.0.0/24"
+	clientIP = "172.29.0.2"
+	mask     = "30"
+	subnet   = "172.29.0.0/30"
 	tunMTU   = 1400
 )
 

@@ -44,13 +44,13 @@ func MarshalFrame(buf []byte, f *Frame, padding int) int {
 		copy(buf[headerSize:], f.Payload)
 	}
 
-	// fill padding with random-ish bytes, last byte = padding length
+	// fill padding: first byte = padding length, rest = random-ish fill
 	if padding > 0 {
 		off := headerSize + payloadLen
-		for i := range padding {
+		buf[off] = byte(padding)
+		for i := 1; i < padding; i++ {
 			buf[off+i] = byte(i * 7) // cheap non-zero fill
 		}
-		buf[total-1] = byte(padding)
 	}
 
 	return total

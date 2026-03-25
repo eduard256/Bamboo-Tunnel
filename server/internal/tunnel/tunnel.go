@@ -1,10 +1,10 @@
 package tunnel
 
 import (
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -17,7 +17,7 @@ var (
 	log   *slog.Logger
 	token string
 
-	// active tunnel connection
+	// active tunnel connection (download stream)
 	activeMu   sync.Mutex
 	activeConn *conn
 
@@ -44,22 +44,18 @@ func Init(mux *http.ServeMux) {
 
 	log = slog.Default().With("module", "tunnel")
 
-	// 64MB / ~1400 bytes per packet ≈ 48000 packets
 	ringBuf = tunnel.NewRingBuffer(48000)
 
-	// register on mux -- handles ALL paths, web module handles non-tunnel requests
 	mux.HandleFunc("/", handler)
 
 	log.Info("tunnel handler registered")
 }
 
-// SetTUNWriter sets the callback for writing packets to TUN device
 func SetTUNWriter(f func([]byte)) {
 	tunWriter = f
 }
 
-// SendPacket sends an IP packet through the active tunnel.
-// If no tunnel is active, packets are buffered in ring buffer.
+// SendPacket sends an IP packet through the active tunnel (download stream).
 func SendPacket(pkt []byte) {
 	activeMu.Lock()
 	c := activeConn
@@ -76,11 +72,25 @@ func SendPacket(pkt []byte) {
 func handler(w http.ResponseWriter, r *http.Request) {
 	// only POST with valid token = tunnel
 	if r.Method != http.MethodPost || !crypto.ValidateRequest(r, token) {
-		// delegate to web handler for static content
 		webHandler(w, r)
 		return
 	}
 
+	path := r.URL.Path
+
+	// /xxx/xxx/data = upload (client -> server), short-lived POST
+	if strings.HasSuffix(path, "/data") {
+		handleUpload(w, r)
+		return
+	}
+
+	// /xxx/xxx/stream = download (server -> client), long-lived chunked response
+	handleDownload(w, r)
+}
+
+// handleDownload opens the download stream (server -> client).
+// Server writes frames into chunked response. Connection stays open.
+func handleDownload(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, `{"error":"streaming not supported"}`, http.StatusInternalServerError)
@@ -89,11 +99,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	log.Info("tunnel client connected", "remote", r.RemoteAddr, "path", r.URL.Path)
 
-	// set response headers to mimic video call stream
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-cache, no-store")
-	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
@@ -116,7 +124,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
-	// register as active connection
+	// register as active
 	activeMu.Lock()
 	prev := activeConn
 	activeConn = c
@@ -131,11 +139,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		c.sendData(pkt)
 	}
 
-	// start heartbeat sender
+	// heartbeat in background
 	go c.heartbeatLoop()
 
-	// read incoming frames from client
-	c.readLoop(r.Body)
+	// block until done -- keep response open
+	<-c.done
 
 	// cleanup
 	activeMu.Lock()
@@ -144,62 +152,74 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	activeMu.Unlock()
 
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
-
 	log.Info("tunnel client disconnected", "remote", r.RemoteAddr)
 }
 
-func (c *conn) sendData(pkt []byte) {
-	buf := make([]byte, protocol.MaxFrameSize)
-	f := &protocol.Frame{
-		Type:    protocol.TypeData,
-		Seq:     c.seq.Add(1),
-		Payload: pkt,
-	}
-	padding := protocol.RandPadding(5, 50)
-	n := protocol.MarshalFrame(buf, f, padding)
+// handleUpload receives frames from client via persistent chunked POST.
+// Client keeps writing frames into the request body as a stream.
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	log.Info("upload stream opened", "remote", r.RemoteAddr, "path", r.URL.Path)
 
-	select {
-	case <-c.done:
-		return
-	default:
-	}
-
-	c.w.Write(buf[:n])
-	c.flusher.Flush()
-}
-
-func (c *conn) readLoop(body io.ReadCloser) {
 	buf := make([]byte, protocol.MaxFrameSize)
 	for {
-		f, err := protocol.ReadFrame(body, buf)
+		f, err := protocol.ReadFrame(r.Body, buf)
 		if err != nil {
-			return
+			break
 		}
-
-		if err := protocol.SkipPadding(body, buf); err != nil {
-			return
+		if err := protocol.SkipPadding(r.Body, buf); err != nil {
+			break
 		}
 
 		switch f.Type {
 		case protocol.TypeData:
 			if tunWriter != nil && len(f.Payload) > 0 {
-				// split coalesced packets
 				packets, _ := protocol.SplitPackets(f.Payload)
 				for _, pkt := range packets {
 					tunWriter(pkt)
 				}
 			}
 		case protocol.TypeHeartbeat:
-			// heartbeat received, connection is alive
+			// alive
 		case protocol.TypeClose:
-			return
+			activeMu.Lock()
+			c := activeConn
+			activeMu.Unlock()
+			if c != nil {
+				c.markDone()
+			}
 		}
 	}
+
+	log.Info("upload stream closed", "remote", r.RemoteAddr)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (c *conn) sendData(pkt []byte) {
+	select {
+	case <-c.done:
+		log.Info("sendData: conn done, dropping")
+		return
+	default:
+	}
+
+	log.Info("sendData: sending", "pktLen", len(pkt))
+
+	// wrap packet in coalesced format for SplitPackets on receiver
+	coalBuf := make([]byte, 2+len(pkt))
+	n := protocol.CoalescePackets(coalBuf, [][]byte{pkt})
+
+	f := &protocol.Frame{
+		Type:    protocol.TypeData,
+		Seq:     c.seq.Add(1),
+		Payload: coalBuf[:n],
+	}
+	buf := make([]byte, protocol.MaxFrameSize)
+	padding := protocol.RandPadding(5, 50)
+	n = protocol.MarshalFrame(buf, f, padding)
+
+	written, err := c.w.Write(buf[:n])
+	log.Info("sendData: written", "n", written, "err", err)
+	c.flusher.Flush()
 }
 
 func (c *conn) heartbeatLoop() {
@@ -231,12 +251,19 @@ func (c *conn) heartbeatLoop() {
 	}
 }
 
-// webHandler is set by the web module
+func (c *conn) markDone() {
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
+}
+
 var webHandler http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// SetWebHandler sets the fallback handler for non-tunnel requests
 func SetWebHandler(h http.HandlerFunc) {
 	webHandler = h
 }
+

@@ -12,8 +12,8 @@ import (
 
 const (
 	// TUN tunnel endpoint (server <-> VPS client)
-	tunIP  = "10.0.0.1"
-	tunMask = "24"
+	tunIP  = "172.29.0.1"
+	tunMask = "30"
 	tunMTU = 1400
 )
 
@@ -106,6 +106,7 @@ func readLoop() {
 			continue
 		}
 
+		log.Info("TUN read", "bytes", n, "dst", fmt.Sprintf("%d.%d.%d.%d", pkt[16], pkt[17], pkt[18], pkt[19]))
 		tunnelmod.SendPacket(pkt)
 	}
 }
