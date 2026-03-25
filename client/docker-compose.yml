@@ -1,8 +1,6 @@
 services:
   bamboo-client:
-    build:
-      context: ..
-      dockerfile: client/Dockerfile
+    image: eduard256/bamboo-client:latest
     container_name: bamboo-client
     restart: always
     cap_add:

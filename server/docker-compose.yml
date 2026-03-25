@@ -1,8 +1,6 @@
 services:
   bamboo-server:
-    build:
-      context: ..
-      dockerfile: server/Dockerfile
+    image: eduard256/bamboo-server:latest
     container_name: bamboo-server
     restart: always
     cap_add:
@@ -17,21 +15,3 @@ services:
       - ./web:/app/web:ro
     sysctls:
       - net.ipv4.ip_forward=1
-    networks:
-      wan:
-      lan:
-        ipv4_address: 192.168.99.1
-
-networks:
-  # WAN: access to Caddy / reverse proxy / internet
-  wan:
-    driver: bridge
-
-  # LAN: DHCP network for devices that need VPN
-  # connect other containers here to route their traffic through VPS
-  lan:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 192.168.99.0/24
-          gateway: 192.168.99.1
