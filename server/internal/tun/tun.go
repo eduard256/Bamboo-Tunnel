@@ -69,7 +69,7 @@ func Init() {
 	}
 
 	// Step 4: route LAN traffic through TUN (to VPS)
-	if err := routeLANThroughTUN(lanIface, dev.Name()); err != nil {
+	if err := routeLANThroughTUN(lanIface, dhcpSubnet, dev.Name(), "172.29.0.2"); err != nil {
 		log.Error("failed to setup routing", "error", err)
 	} else {
 		log.Info("routing configured", "from", dhcpSubnet, "via", dev.Name())
@@ -121,7 +121,7 @@ func configureLAN(iface, gateway, subnet string) error {
 	return nil
 }
 
-func routeLANThroughTUN(lanIface, tunDev string) error {
+func routeLANThroughTUN(lanIface, lanSubnet, tunDev, tunPeerIP string) error {
 	// clean up stale rules from previous runs (ignore errors)
 	for range 10 {
 		run("iptables", "-D", "FORWARD", "-i", lanIface, "-o", tunDev, "-j", "ACCEPT")
@@ -129,11 +129,21 @@ func routeLANThroughTUN(lanIface, tunDev string) error {
 		run("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", tunDev, "-j", "MASQUERADE")
 	}
 
-	// iptables FORWARD: allow LAN -> TUN
+	// policy routing: traffic from LAN subnet uses separate routing table
+	// table 100: default route via TUN peer (VPS)
+	run("ip", "rule", "del", "from", lanSubnet, "table", "100")
+	run("ip", "route", "del", "default", "table", "100")
+	if err := run("ip", "route", "add", "default", "via", tunPeerIP, "dev", tunDev, "table", "100"); err != nil {
+		return fmt.Errorf("route table: %w", err)
+	}
+	if err := run("ip", "rule", "add", "from", lanSubnet, "table", "100"); err != nil {
+		return fmt.Errorf("ip rule: %w", err)
+	}
+
+	// iptables FORWARD: allow LAN <-> TUN
 	if err := run("iptables", "-A", "FORWARD", "-i", lanIface, "-o", tunDev, "-j", "ACCEPT"); err != nil {
 		return fmt.Errorf("forward out: %w", err)
 	}
-	// iptables FORWARD: allow TUN -> LAN (return traffic)
 	if err := run("iptables", "-A", "FORWARD", "-i", tunDev, "-o", lanIface, "-m", "state",
 		"--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
 		return fmt.Errorf("forward in: %w", err)
