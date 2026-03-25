@@ -1,10 +1,8 @@
 package tunnel
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +18,12 @@ import (
 	"github.com/eduard256/Bamboo-Tunnel/pkg/protocol"
 )
 
+const (
+	batchSize    = 32 * 1024
+	batchTimeout = time.Millisecond
+	pktChanSize  = 4096
+)
+
 var (
 	log        *slog.Logger
 	serverURL  string
@@ -32,18 +36,19 @@ var (
 
 	tunWriter func([]byte)
 
-	activeMu   sync.Mutex
-	activeConn *session
+	activeConn atomic.Pointer[session]
+
+	framePool = sync.Pool{New: func() any { b := make([]byte, protocol.MaxFrameSize); return &b }}
 )
 
 type session struct {
 	client    *http.Client
 	sessionID string
-	body      io.ReadCloser // download stream (server -> client)
-	uploadPW  *io.PipeWriter // upload stream (client -> server)
-	uploadMu  sync.Mutex
+	body      io.ReadCloser
+	uploadPW  *io.PipeWriter
 	done      chan struct{}
 	seq       atomic.Uint32
+	pktCh     chan []byte // upload packet channel
 }
 
 func Init() {
@@ -78,15 +83,20 @@ func Init() {
 func SetTUNWriter(f func([]byte)) { tunWriter = f }
 
 func SendPacket(pkt []byte) {
-	activeMu.Lock()
-	s := activeConn
-	activeMu.Unlock()
-
+	s := activeConn.Load()
 	if s == nil {
 		return
 	}
 
-	s.sendData(pkt)
+	// copy packet -- TUN read buffer is reused
+	cp := make([]byte, len(pkt))
+	copy(cp, pkt)
+
+	select {
+	case s.pktCh <- cp:
+	default:
+		// channel full, drop (TCP will retransmit)
+	}
 }
 
 func sessionLoop() {
@@ -106,11 +116,7 @@ func sessionLoop() {
 		}
 		backoff = 0
 
-		activeMu.Lock()
-		prev := activeConn
-		activeConn = s
-		activeMu.Unlock()
-
+		prev := activeConn.Swap(s)
 		if prev != nil {
 			prev.close()
 		}
@@ -119,6 +125,7 @@ func sessionLoop() {
 		log.Info("session started", "duration", duration, "id", s.sessionID)
 
 		go s.readLoop()
+		go s.batchUploadLoop()
 		go s.heartbeatLoop()
 
 		select {
@@ -126,11 +133,7 @@ func sessionLoop() {
 			log.Info("session rotating")
 		case <-s.done:
 			log.Warn("session died, reconnecting")
-			activeMu.Lock()
-			if activeConn == s {
-				activeConn = nil
-			}
-			activeMu.Unlock()
+			activeConn.CompareAndSwap(s, nil)
 		}
 	}
 }
@@ -139,8 +142,9 @@ func connect() (*session, error) {
 	client := newHTTPClient()
 	sessionID := randSessionID()
 
-	// Step 1: GET / (mimic browser)
 	log.Info("connecting", "id", sessionID)
+
+	// Step 1: GET /
 	req, _ := http.NewRequest(http.MethodGet, serverURL+"/", nil)
 	setBrowserHeaders(req)
 	resp, err := client.Do(req)
@@ -159,7 +163,6 @@ func connect() (*session, error) {
 
 	// Step 3: open download stream
 	downloadPath := fmt.Sprintf("%s/%s/stream", tunnelPath, sessionID)
-
 	req, _ = http.NewRequest(http.MethodPost, serverURL+downloadPath, nil)
 	setBrowserHeaders(req)
 	req.Header.Set("Content-Type", "application/x-protobuf")
@@ -175,24 +178,24 @@ func connect() (*session, error) {
 		return nil, fmt.Errorf("tunnel: download returned %d", resp.StatusCode)
 	}
 
-	log.Info("download stream opened", "proto", resp.Proto)
-
 	s := &session{
 		client:    client,
 		sessionID: sessionID,
 		body:      resp.Body,
 		done:      make(chan struct{}),
+		pktCh:     make(chan []byte, pktChanSize),
 	}
 
 	// read server handshake
-	buf := make([]byte, protocol.MaxFrameSize)
+	buf := getFrameBuf()
+	defer putFrameBuf(buf)
 	for i := 0; i < 3; i++ {
-		f, err := protocol.ReadFrame(resp.Body, buf)
+		f, err := protocol.ReadFrame(resp.Body, *buf)
 		if err != nil {
 			s.close()
 			return nil, fmt.Errorf("tunnel: handshake read %d: %w", i, err)
 		}
-		if err := protocol.SkipPadding(resp.Body, buf); err != nil {
+		if err := protocol.SkipPadding(resp.Body, *buf); err != nil {
 			s.close()
 			return nil, fmt.Errorf("tunnel: handshake padding %d: %w", i, err)
 		}
@@ -211,14 +214,12 @@ func connect() (*session, error) {
 	uploadReq.Header.Set("Content-Type", "application/x-protobuf")
 	uploadReq.AddCookie(&http.Cookie{Name: crypto.CookieName, Value: token})
 
-	// fire and forget -- we don't care about upload response
 	go func() {
 		resp, err := client.Do(uploadReq)
 		if err != nil {
 			log.Info("upload stream ended", "error", err)
 		} else {
 			resp.Body.Close()
-			log.Info("upload stream ended", "status", resp.StatusCode)
 		}
 		s.markDone()
 	}()
@@ -227,39 +228,98 @@ func connect() (*session, error) {
 	return s, nil
 }
 
-func (s *session) sendData(pkt []byte) {
-	select {
-	case <-s.done:
-		return
-	default:
+// batchUploadLoop collects packets and writes them as batched frames to upload pipe
+func (s *session) batchUploadLoop() {
+	coalBuf := make([]byte, batchSize+2*1500)
+	frameBuf := make([]byte, protocol.MaxFrameSize)
+	timer := time.NewTimer(batchTimeout)
+	timer.Stop()
+
+	var packets [][]byte
+	var coalSize int
+
+	flush := func() {
+		if len(packets) == 0 {
+			return
+		}
+
+		off := protocol.CoalescePackets(coalBuf, packets)
+
+		f := &protocol.Frame{
+			Type:    protocol.TypeData,
+			Seq:     s.seq.Add(1),
+			Payload: coalBuf[:off],
+		}
+		n := protocol.MarshalFrame(frameBuf, f, protocol.RandPadding(1, 3))
+		s.uploadPW.Write(frameBuf[:n])
+
+		packets = packets[:0]
+		coalSize = 0
 	}
 
-	// wrap in coalesced format
-	coalBuf := make([]byte, 2+len(pkt))
-	cn := protocol.CoalescePackets(coalBuf, [][]byte{pkt})
+	for {
+		select {
+		case <-s.done:
+			flush()
+			return
 
-	f := &protocol.Frame{
-		Type:    protocol.TypeData,
-		Seq:     s.seq.Add(1),
-		Payload: coalBuf[:cn],
+		case pkt := <-s.pktCh:
+			if pkt == nil {
+				// heartbeat signal
+				flush()
+				hb := &protocol.Frame{
+					Type:    protocol.TypeHeartbeat,
+					Seq:     s.seq.Add(1),
+					Payload: protocol.MakeHeartbeatPayload(),
+				}
+				n := protocol.MarshalFrame(frameBuf, hb, protocol.RandPadding(5, 20))
+				s.uploadPW.Write(frameBuf[:n])
+				continue
+			}
+
+			packets = append(packets, pkt)
+			coalSize += 2 + len(pkt)
+
+			if coalSize >= batchSize {
+				timer.Stop()
+				flush()
+				continue
+			}
+
+			// drain channel
+			drained := true
+			for drained {
+				select {
+				case pkt2 := <-s.pktCh:
+					if pkt2 == nil {
+						continue
+					}
+					packets = append(packets, pkt2)
+					coalSize += 2 + len(pkt2)
+					if coalSize >= batchSize {
+						timer.Stop()
+						flush()
+					}
+				default:
+					drained = false
+				}
+			}
+
+			if len(packets) > 0 {
+				timer.Reset(batchTimeout)
+			}
+
+		case <-timer.C:
+			flush()
+		}
 	}
-
-	buf := make([]byte, protocol.MaxFrameSize)
-	padding := protocol.RandPadding(5, 50)
-	n := protocol.MarshalFrame(buf, f, padding)
-
-	s.uploadMu.Lock()
-	s.uploadPW.Write(buf[:n])
-	s.uploadMu.Unlock()
 }
 
 func (s *session) readLoop() {
-	log.Info("readLoop: started")
 	buf := make([]byte, protocol.MaxFrameSize)
 	for {
 		f, err := protocol.ReadFrame(s.body, buf)
 		if err != nil {
-			log.Info("readLoop: error", "error", err)
 			s.markDone()
 			return
 		}
@@ -295,33 +355,21 @@ func (s *session) heartbeatLoop() {
 		case <-time.After(interval):
 		}
 
-		f := &protocol.Frame{
-			Type:    protocol.TypeHeartbeat,
-			Seq:     s.seq.Add(1),
-			Payload: protocol.MakeHeartbeatPayload(),
+		// send nil as heartbeat signal to batchUploadLoop
+		select {
+		case s.pktCh <- nil:
+		case <-s.done:
+			return
 		}
-		buf := make([]byte, protocol.MaxFrameSize)
-		n := protocol.MarshalFrame(buf, f, protocol.RandPadding(5, 20))
-
-		s.uploadMu.Lock()
-		s.uploadPW.Write(buf[:n])
-		s.uploadMu.Unlock()
 	}
 }
 
 func (s *session) close() {
-	f := &protocol.Frame{
-		Type: protocol.TypeClose,
-		Seq:  s.seq.Add(1),
-	}
+	f := &protocol.Frame{Type: protocol.TypeClose, Seq: s.seq.Add(1)}
 	buf := make([]byte, protocol.MaxFrameSize)
 	n := protocol.MarshalFrame(buf, f, protocol.RandPadding(5, 15))
-
-	s.uploadMu.Lock()
 	s.uploadPW.Write(buf[:n])
 	s.uploadPW.Close()
-	s.uploadMu.Unlock()
-
 	s.markDone()
 	s.body.Close()
 }
@@ -337,11 +385,13 @@ func (s *session) markDone() {
 func newHTTPClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12},
-			ForceAttemptHTTP2:  true,
-			MaxIdleConns:       100,
-			IdleConnTimeout:    90 * time.Second,
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+			ForceAttemptHTTP2:   true,
+			MaxIdleConns:        100,
+			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
+			WriteBufferSize:     64 * 1024,
+			ReadBufferSize:      64 * 1024,
 			DialContext: (&net.Dialer{
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -367,6 +417,9 @@ func setBrowserHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-User", "?1")
 }
+
+func getFrameBuf() *[]byte  { return framePool.Get().(*[]byte) }
+func putFrameBuf(b *[]byte) { framePool.Put(b) }
 
 func randSessionID() string {
 	const chars = "abcdef0123456789"
@@ -396,24 +449,15 @@ func parseDuration(s string, def time.Duration) time.Duration {
 }
 
 func UseContext() context.Context {
-	activeMu.Lock()
-	s := activeConn
-	activeMu.Unlock()
-
+	s := activeConn.Load()
 	ctx, cancel := context.WithCancel(context.Background())
 	if s == nil {
 		cancel()
 		return ctx
 	}
-
 	go func() {
 		<-s.done
 		cancel()
 	}()
-
 	return ctx
 }
-
-// unused but needed for compilation
-var _ = bytes.NewReader
-var _ = binary.BigEndian

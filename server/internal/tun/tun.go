@@ -106,7 +106,6 @@ func readLoop() {
 			continue
 		}
 
-		log.Info("TUN read", "bytes", n, "dst", fmt.Sprintf("%d.%d.%d.%d", pkt[16], pkt[17], pkt[18], pkt[19]))
 		tunnelmod.SendPacket(pkt)
 	}
 }
