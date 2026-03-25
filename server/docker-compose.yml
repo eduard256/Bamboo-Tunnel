@@ -1,0 +1,26 @@
+services:
+  bamboo-server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    container_name: bamboo-server
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./web:/app/web:ro
+    networks:
+      - bamboo
+
+networks:
+  bamboo:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
